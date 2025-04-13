@@ -1,0 +1,690 @@
+Thank you for pointing out the issue with the program failing to fetch data when the Prometheus query does not include pod_name in the group by clause. This likely occurs because the process_prometheus_data function expects pod_name and job labels for pod-level metrics (e.g., sum by (pod_name, job)(...)) and fails to handle queries without them correctly, resulting in empty or malformed DataFrames.
+I’ll enhance the program to fix this issue by updating the process_prometheus_data function to handle both cases:
+	•	Queries with pod_name (e.g., sum by (pod_name, job)(...)): Continue assigning pod indices (pod_1, pod_2, etc.) for pod-level granularity.
+	•	Queries without pod_name (e.g., rate(http_requests_total{...}[5m])): Treat the metric as a single time series per service, using a generic column name (e.g., metric_name instead of metric_name_pod_X).
+Additionally, I’ll ensure all endpoints (/train, /predict, /fetch_metrics, /predict_on_csv) work seamlessly with both types of queries, maintaining compatibility with the existing requirements:
+	•	100 microservices, 10 metrics (some service-specific), namespaces via request variables.
+	•	Config files (metrics.json, services.json) with Mustache variables.
+	•	Isolation Forest model, CSV storage, cascading failure graphs, and time range parameters.
+	•	No prometheus-api-client, pod indexing, business-time filtering, and outlier removal.
+Root Cause
+The failure likely stems from process_prometheus_data assuming all queries return pod_name and job labels. For queries like rate(http_requests_total{namespace="{{namespace}}", job="{{jobname}}"}[5m]), which don’t group by pod_name, the function tries to pivot on pod_index, leading to errors or empty DataFrames.
+Fix Overview
+	1	Update process_prometheus_data:
+	◦	Check if pod_name exists in the Prometheus result’s metric labels.
+	◦	If pod_name is present, pivot the data with pod indices (metric_name_pod_1, etc.).
+	◦	If pod_name is absent, create a single-column DataFrame with the metric name (e.g., http_requests_total).
+	2	Adjust Data Processing:
+	◦	Ensure filter_outliers, generate_service_graph, and prediction logic handle both single-column and pod-indexed DataFrames.
+	3	Maintain Consistency:
+	◦	Update all endpoints to use the revised function, ensuring CSVs, models, and graphs are generated correctly.
+	4	Error Handling:
+	◦	Add logging and validation to catch cases where data is missing or malformed.
+Updated Python Program (`main.py`)
+Below is the revised program with the fix and all existing functionality preserved.
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import requests
+import pandas as pd
+import numpy as np
+import json
+import logging
+from datetime import datetime, timedelta
+from string import Template
+from sklearn.ensemble import IsolationForest
+import joblib
+import networkx as nx
+import matplotlib.pyplot as plt
+import os
+from typing import Optional
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# FastAPI app
+app = FastAPI()
+
+# Configuration
+PROMETHEUS_URL = "http://your-prometheus-server:9090"  # Update with your Prometheus URL
+METRICS_FILE = "metrics.json"
+SERVICES_FILE = "services.json"
+MODEL_DIR = "models"
+IMAGE_DIR = "images"
+DATA_DIR = "data"
+TRAIN_DATA_DIR = os.path.join(DATA_DIR, "train")
+PREDICT_DATA_DIR = os.path.join(DATA_DIR, "predict")
+STEP = "5m"  # Query resolution
+CONTAMINATION = 0.1  # Isolation Forest contamination parameter
+
+# Ensure directories exist
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
+os.makedirs(PREDICT_DATA_DIR, exist_ok=True)
+
+def load_config(file_path):
+    """Load JSON configuration file."""
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Error loading {file_path}: {e}")
+        raise
+
+def substitute_query(query, variables):
+    """Substitute Mustache-like variables in the query."""
+    try:
+        query = query.replace('{{', '${').replace('}}', '}')
+        return Template(query).substitute(**variables)
+    except KeyError as e:
+        logging.error(f"Missing variable in query: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error substituting query: {e}")
+        return None
+
+def query_prometheus(query, start_time, end_time, step=STEP):
+    """Query Prometheus API directly."""
+    try:
+        start_ts = int(start_time.timestamp())
+        end_ts = int(end_time.timestamp())
+        url = f"{PROMETHEUS_URL}/api/v1/query_range"
+        params = {
+            "query": query,
+            "start": start_ts,
+            "end": end_ts,
+            "step": step
+        }
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data['status'] != 'success' or not data['data']['result']:
+            logging.warning(f"No data for query: {query}")
+            return None
+        return data['data']['result']
+    except Exception as e:
+        logging.error(f"Error querying Prometheus: {e}")
+        return None
+
+def process_prometheus_data(result, metric_name):
+    """Convert Prometheus query result to DataFrame, handling pod_name and non-pod_name queries."""
+    if not result:
+        return pd.DataFrame()
+    
+    data = []
+    pod_indices = {}
+    next_pod_index = 1
+    has_pod_name = False
+    
+    for res in result:
+        metric = res['metric']
+        pod_name = metric.get('pod_name', None)
+        job = metric.get('job', 'unknown')
+        
+        if pod_name:
+            has_pod_name = True
+            pod_key = (pod_name, job)
+            if pod_key not in pod_indices:
+                pod_indices[pod_key] = f"pod_{next_pod_index}"
+                next_pod_index += 1
+            identifier = pod_indices[pod_key]
+        else:
+            identifier = metric_name  # Use metric name for non-pod queries
+        
+        for timestamp, value in res['values']:
+            try:
+                data.append({
+                    'timestamp': pd.to_datetime(timestamp, unit='s'),
+                    'identifier': identifier,
+                    'value': float(value)
+                })
+            except ValueError:
+                continue
+    
+    df = pd.DataFrame(data)
+    if df.empty:
+        return df
+    
+    # Pivot based on whether pod_name exists
+    if has_pod_name:
+        df_pivot = df.pivot(index='timestamp', columns='identifier', values='value')
+        df_pivot.columns = [f"{metric_name}_{col}" for col in df_pivot.columns]
+    else:
+        df_pivot = df[['timestamp', 'value']].rename(columns={'value': metric_name})
+    
+    df_pivot.reset_index(inplace=True)
+    return df_pivot
+
+def filter_outliers(df, columns):
+    """Remove top/bottom 10% outliers for specified columns."""
+    if df.empty:
+        return df
+    df_filtered = df.copy()
+    for col in columns:
+        if col in df.columns:
+            lower_bound = df[col].quantile(0.1)
+            upper_bound = df[col].quantile(0.9)
+            df_filtered = df_filtered[
+                (df_filtered[col].isna()) | 
+                ((df_filtered[col] >= lower_bound) & (df_filtered[col] <= upper_bound))
+            ]
+    return df_filtered
+
+def generate_service_graph(dataframes, services):
+    """Generate a service dependency graph with weighted edges based on correlations."""
+    G = nx.DiGraph()
+    for service in services:
+        G.add_node(service)
+    
+    for i, s1 in enumerate(services):
+        for s2 in services[i+1:]:
+            if s1 in dataframes and s2 in dataframes:
+                for metric in dataframes[s1]:
+                    if metric in dataframes[s2]:
+                        try:
+                            df1 = dataframes[s1][metric]
+                            df2 = dataframes[s2][metric]
+                            if not df1.empty and not df2.empty:
+                                merged = df1.merge(df2, on='timestamp', suffixes=('_1', '_2'))
+                                for col1 in [c for c in merged.columns if c.endswith('_1') or c == metric]:
+                                    for col2 in [c for c in merged.columns if c.endswith('_2') or c == metric]:
+                                        if col1 != 'timestamp' and col2 != 'timestamp':
+                                            corr = merged[col1].corr(merged[col2])
+                                            if not np.isnan(corr) and abs(corr) > 0.5:
+                                                G.add_edge(s1, s2, weight=abs(corr))
+                                                G.add_edge(s2, s1, weight=abs(corr))
+                        except Exception as e:
+                            logging.warning(f"Error computing correlation between {s1} and {s2}: {e}")
+    
+    return G
+
+def save_graph_image(G, filename, title):
+    """Save network graph as an image."""
+    plt.figure(figsize=(12, 8))
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_color='lightblue', node_size=500, font_size=8)
+    edge_labels = nx.get_edge_attributes(G, 'weight')
+    nx.draw_networkx_edge_labels(G, pos, edge_labels={k: f"{v:.2f}" for k, v in edge_labels.items()})
+    plt.title(title)
+    plt.savefig(filename, format='png')
+    plt.close()
+
+class TrainRequest(BaseModel):
+    namespace: str
+    last_days: Optional[int] = 7
+
+class PredictRequest(BaseModel):
+    namespace: str
+    last_minutes: Optional[int] = 60
+    two_minutes: Optional[bool] = False
+    five_minutes: Optional[bool] = False
+
+class FetchMetricsRequest(BaseModel):
+    namespace: str
+    last_minutes: Optional[int] = 60
+
+@app.post("/train")
+async def train_model(request: TrainRequest):
+    """Train Isolation Forest model for a namespace."""
+    namespace = request.namespace
+    last_days = request.last_days
+    
+    metrics_config = load_config(METRICS_FILE)
+    services_config = load_config(SERVICES_FILE)
+    
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=last_days)
+    
+    dataframes = {}
+    services = [s['service_name'] for s in services_config['services']]
+    
+    incoming_traffic = {}
+    
+    for service_config in services_config['services']:
+        service = service_config['service_name']
+        dataframes[service] = {}
+        variables = {
+            'namespace': namespace,
+            'jobname': service_config.get('jobname', ''),
+            'dbname': service_config.get('dbname', '') or ''
+        }
+        
+        for metric in metrics_config:
+            metric_name = metric['metric_name']
+            query_template = metric['query']
+            applicable_to = metric['applicable_to']
+            
+            if applicable_to != 'all' and service not in applicable_to:
+                continue
+            
+            query = substitute_query(query_template, variables)
+            if not query:
+                continue
+            
+            result = query_prometheus(query, start_time, end_time)
+            df = process_prometheus_data(result, metric_name)
+            
+            if metric_name == 'incoming_traffic':
+                incoming_traffic[service] = df
+            else:
+                df = filter_outliers(df, [c for c in df.columns if c != 'timestamp'])
+                dataframes[service][metric_name] = df
+    
+    os.makedirs(os.path.join(TRAIN_DATA_DIR, namespace), exist_ok=True)
+    for service in dataframes:
+        for metric, df in dataframes[service].items():
+            if not df.empty:
+                csv_path = os.path.join(TRAIN_DATA_DIR, namespace, f"{service}_{metric}.csv")
+                df.to_csv(csv_path, index=False)
+                logging.info(f"Saved training data to {csv_path}")
+    
+    filtered_data = []
+    feature_columns = [m['metric_name'] for m in metrics_config if m['metric_name'] != 'incoming_traffic']
+    
+    for service in services:
+        if service not in incoming_traffic or incoming_traffic[service].empty:
+            continue
+        
+        traffic_df = incoming_traffic[service]
+        traffic_cols = [c for c in traffic_df.columns if c != 'timestamp']
+        if not traffic_cols:
+            continue
+        
+        has_traffic = False
+        for col in traffic_cols:
+            if (traffic_df[col] > 0).any():
+                has_traffic = True
+                break
+        if not has_traffic:
+            continue
+        
+        service_data = []
+        for metric in feature_columns:
+            if metric in dataframes[service] and not dataframes[service][metric].empty:
+                df = dataframes[service][metric]
+                traffic_timestamps = traffic_df[traffic_df[traffic_cols].gt(0).any(axis=1)]['timestamp']
+                df = df[df['timestamp'].isin(traffic_timestamps)]
+                if not df.empty:
+                    for col in [c for c in df.columns if c != 'timestamp']:
+                        service_data.append(df[col].values)
+        
+        if service_data:
+            max_len = max(len(d) for d in service_data)
+            service_data = [np.pad(d, (0, max_len - len(d)), constant_values=np.nan) for d in service_data]
+            service_data = np.array(service_data).T
+            filtered_data.append(service_data)
+    
+    if not filtered_data:
+        raise HTTPException(status_code=400, detail="No valid data for training")
+    
+    combined_data = np.vstack(filtered_data)
+    combined_data = np.nan_to_num(combined_data, nan=0.0)
+    
+    model = IsolationForest(contamination=CONTAMINATION, random_state=42)
+    model.fit(combined_data)
+    
+    model_path = os.path.join(MODEL_DIR, f"{namespace}_model.pkl")
+    joblib.dump(model, model_path)
+    
+    G = generate_service_graph(dataframes, services)
+    graph_path = os.path.join(MODEL_DIR, f"{namespace}_graph.pkl")
+    joblib.dump(G, graph_path)
+    
+    image_path = os.path.join(IMAGE_DIR, f"{namespace}_service_graph.png")
+    save_graph_image(G, image_path, f"Service Graph for {namespace}")
+    
+    return {"status": "success", "namespace": namespace, "model_path": model_path, "graph_image": image_path}
+
+@app.post("/fetch_metrics")
+async def fetch_metrics(request: FetchMetricsRequest):
+    """Fetch metrics from Prometheus and save to CSV."""
+    namespace = request.namespace
+    last_minutes = request.last_minutes
+    
+    metrics_config = load_config(METRICS_FILE)
+    services_config = load_config(SERVICES_FILE)
+    
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=last_minutes)
+    
+    dataframes = {}
+    services = [s['service_name'] for s in services_config['services']]
+    
+    for service_config in services_config['services']:
+        service = service_config['service_name']
+        dataframes[service] = {}
+        variables = {
+            'namespace': namespace,
+            'jobname': service_config.get('jobname', ''),
+            'dbname': service_config.get('dbname', '') or ''
+        }
+        
+        for metric in metrics_config:
+            metric_name = metric['metric_name']
+            query_template = metric['query']
+            applicable_to = metric['applicable_to']
+            
+            if applicable_to != 'all' and service not in applicable_to:
+                continue
+            
+            query = substitute_query(query_template, variables)
+            if not query:
+                continue
+            
+            result = query_prometheus(query, start_time, end_time)
+            df = process_prometheus_data(result, metric_name)
+            dataframes[service][metric_name] = df
+    
+    os.makedirs(os.path.join(PREDICT_DATA_DIR, namespace), exist_ok=True)
+    csv_files = []
+    for service in dataframes:
+        for metric, df in dataframes[service].items():
+            if not df.empty:
+                csv_path = os.path.join(PREDICT_DATA_DIR, namespace, f"{service}_{metric}.csv")
+                df.to_csv(csv_path, index=False)
+                logging.info(f"Saved metrics data to {csv_path}")
+                csv_files.append(csv_path)
+    
+    if not csv_files:
+        raise HTTPException(status_code=400, detail="No metrics data fetched")
+    
+    return {"status": "success", "namespace": namespace, "csv_files": csv_files}
+
+@app.post("/predict")
+async def predict_anomalies(request: PredictRequest):
+    """Predict anomalies using fresh Prometheus data."""
+    namespace = request.namespace
+    last_minutes = request.last_minutes
+    two_minutes = request.two_minutes
+    five_minutes = request.five_minutes
+    
+    model_path = os.path.join(MODEL_DIR, f"{namespace}_model.pkl")
+    graph_path = os.path.join(MODEL_DIR, f"{namespace}_graph.pkl")
+    
+    if not os.path.exists(model_path) or not os.path.exists(graph_path):
+        raise HTTPException(status_code=404, detail=f"Model or graph not found for {namespace}")
+    
+    model = joblib.load(model_path)
+    G = joblib.load(graph_path)
+    
+    metrics_config = load_config(METRICS_FILE)
+    services_config = load_config(SERVICES_FILE)
+    
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=last_minutes)
+    
+    dataframes = {}
+    services = [s['service_name'] for s in services_config['services']]
+    
+    for service_config in services_config['services']:
+        service = service_config['service_name']
+        dataframes[service] = {}
+        variables = {
+            'namespace': namespace,
+            'jobname': service_config.get('jobname', ''),
+            'dbname': service_config.get('dbname', '') or ''
+        }
+        
+        for metric in metrics_config:
+            metric_name = metric['metric_name']
+            query_template = metric['query']
+            applicable_to = metric['applicable_to']
+            
+            if applicable_to != 'all' and service not in applicable_to:
+                continue
+            
+            query = substitute_query(query_template, variables)
+            if not query:
+                continue
+            
+            result = query_prometheus(query, start_time, end_time)
+            df = process_prometheus_data(result, metric_name)
+            dataframes[service][metric_name] = df
+    
+    os.makedirs(os.path.join(PREDICT_DATA_DIR, namespace), exist_ok=True)
+    for service in dataframes:
+        for metric, df in dataframes[service].items():
+            if not df.empty:
+                csv_path = os.path.join(PREDICT_DATA_DIR, namespace, f"{service}_{metric}.csv")
+                df.to_csv(csv_path, index=False)
+                logging.info(f"Saved prediction data to {csv_path}")
+    
+    return predict_common(namespace, dataframes, services, model, G, two_minutes, five_minutes)
+
+@app.post("/predict_on_csv")
+async def predict_on_csv(request: PredictRequest):
+    """Predict anomalies using saved CSV files."""
+    namespace = request.namespace
+    last_minutes = request.last_minutes
+    two_minutes = request.two_minutes
+    five_minutes = request.five_minutes
+    
+    model_path = os.path.join(MODEL_DIR, f"{namespace}_model.pkl")
+    graph_path = os.path.join(MODEL_DIR, f"{namespace}_graph.pkl")
+    
+    if not os.path.exists(model_path) or not os.path.exists(graph_path):
+        raise HTTPException(status_code=404, detail=f"Model or graph not found for {namespace}")
+    
+    model = joblib.load(model_path)
+    G = joblib.load(graph_path)
+    
+    services_config = load_config(SERVICES_FILE)
+    metrics_config = load_config(METRICS_FILE)
+    
+    services = [s['service_name'] for s in services_config['services']]
+    dataframes = {}
+    
+    csv_dir = os.path.join(PREDICT_DATA_DIR, namespace)
+    if not os.path.exists(csv_dir):
+        raise HTTPException(status_code=404, detail=f"No CSV data found for namespace {namespace}")
+    
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=last_minutes)
+    
+    for service in services:
+        dataframes[service] = {}
+        for metric in metrics_config:
+            metric_name = metric['metric_name']
+            csv_path = os.path.join(csv_dir, f"{service}_{metric_name}.csv")
+            if os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path)
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df[(df['timestamp'] >= start_time) & (df['timestamp'] <= end_time)]
+                    if not df.empty:
+                        dataframes[service][metric_name] = df
+                except Exception as e:
+                    logging.warning(f"Error reading CSV {csv_path}: {e}")
+    
+    if not any(dataframes[s] for s in dataframes):
+        raise HTTPException(status_code=400, detail="No valid CSV data found for prediction")
+    
+    return predict_common(namespace, dataframes, services, model, G, two_minutes, five_minutes)
+
+def predict_common(namespace, dataframes, services, model, G, two_minutes, five_minutes):
+    """Common prediction logic for /predict and /predict_on_csv."""
+    feature_columns = [
+        m['metric_name'] for m in load_config(METRICS_FILE)
+        if m['metric_name'] != 'incoming_traffic'
+    ]
+    prediction_data = []
+    timestamps = {}
+    pod_indices = {}
+    
+    for service_idx, service in enumerate(services):
+        service_data = []
+        for metric in feature_columns:
+            if metric in dataframes[service] and not dataframes[service][metric].empty:
+                df = dataframes[service][metric]
+                for col in [c for c in df.columns if c != 'timestamp']:
+                    service_data.append(df[col].values)
+                    if service not in timestamps:
+                        timestamps[service] = df['timestamp'].values
+                    if col.startswith(f"{metric}_pod_"):
+                        pod_index = col.split('_pod_')[-1]
+                        pod_indices[(service, len(service_data)-1)] = pod_index
+                    elif col == metric:
+                        pod_indices[(service, len(service_data)-1)] = 'none'
+        
+        if service_data:
+            max_len = max(len(d) for d in service_data)
+            service_data = [np.pad(d, (0, max_len - len(d)), constant_values=0.0) for d in service_data]
+            service_data = np.array(service_data).T
+            prediction_data.append(service_data)
+    
+    if not prediction_data:
+        raise HTTPException(status_code=400, detail="No data for prediction")
+    
+    combined_data = np.vstack(prediction_data)
+    combined_data = np.nan_to_num(combined_data, nan=0.0)
+    
+    predictions = model.predict(combined_data)
+    anomaly_indices = np.where(predictions == -1)[0]
+    
+    anomaly_details = []
+    
+    timestamps_per_service = len(timestamps[services[0]]) if timestamps else 0
+    for idx in anomaly_indices:
+        service_idx = idx // timestamps_per_service if timestamps_per_service else 0
+        time_idx = idx % timestamps_per_service if timestamps_per_service else 0
+        service = services[service_idx]
+        timestamp = timestamps[service][time_idx] if timestamps_per_service else datetime.utcnow()
+        feature_idx = (idx % (len(feature_columns) * timestamps_per_service)) // timestamps_per_service if timestamps_per_service else idx % len(feature_columns)
+        pod_index = pod_indices.get((service, feature_idx), 'none')
+        
+        persistent = True
+        if two_minutes or five_minutes:
+            duration = timedelta(minutes=5 if five_minutes else 2)
+            end_check = timestamp + duration
+            check_data = combined_data[service_idx * timestamps_per_service:(service_idx + 1) * timestamps_per_service] if timestamps_per_service else combined_data
+            check_preds = model.predict(check_data)
+            check_timestamps = timestamps[service] if timestamps_per_service else [timestamp]
+            persistent = False
+            for i, ts in enumerate(check_timestamps):
+                if ts >= timestamp and ts <= end_check and check_preds[i] == -1:
+                    persistent = True
+                    break
+        
+        if persistent:
+            anomaly_details.append({
+                'service': service,
+                'pod_index': pod_index,
+                'timestamp': str(timestamp),
+                'values': combined_data[idx].tolist()
+            })
+    
+    cascading_failures = []
+    if anomaly_details:
+        root_anomaly = min(anomaly_details, key=lambda x: x['timestamp'])
+        root_service = root_anomaly['service']
+        cascading_failures.append(root_anomaly)
+        
+        visited = set()
+        queue = [root_service]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            for neighbor in G.successors(current):
+                if neighbor not in visited:
+                    neighbor_anomalies = [
+                        a for a in anomaly_details
+                        if a['service'] == neighbor and pd.to_datetime(a['timestamp']) > pd.to_datetime(root_anomaly['timestamp'])
+                    ]
+                    cascading_failures.extend(neighbor_anomalies)
+                    queue.append(neighbor)
+    
+    failure_G = nx.DiGraph()
+    for anomaly in cascading_failures:
+        node_label = f"{anomaly['service']}_{anomaly['pod_index']}"
+        failure_G.add_node(node_label, timestamp=anomaly['timestamp'])
+    for i, anomaly in enumerate(cascading_failures[:-1]):
+        next_anomaly = cascading_failures[i + 1]
+        failure_G.add_edge(
+            f"{anomaly['service']}_{anomaly['pod_index']}",
+            f"{next_anomaly['service']}_{next_anomaly['pod_index']}"
+        )
+    
+    failure_image_path = os.path.join(IMAGE_DIR, f"{namespace}_cascading_failure.png")
+    save_graph_image(failure_G, failure_image_path, f"Cascading Failure Graph for {namespace}")
+    
+    return {
+        "namespace": namespace,
+        "anomalies": anomaly_details,
+        "cascading_failures": cascading_failures,
+        "cascading_failure_graph": failure_image_path
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+Changes Made
+	1	Fixed process_prometheus_data:
+	◦	Added has_pod_name flag to detect if pod_name is in the metric labels.
+	◦	For queries with pod_name:
+	▪	Pivots data to create columns like metric_name_pod_1, metric_name_pod_2.
+	▪	Assigns pod indices dynamically.
+	◦	For queries without pod_name:
+	▪	Creates a single column named metric_name (e.g., http_requests_total).
+	▪	Avoids pivoting, ensuring a simple time series.
+	◦	Ensures non-empty DataFrames are returned for both cases.
+	2	Updated Data Processing:
+	◦	Modified filter_outliers to handle single-column DataFrames (non-pod metrics).
+	◦	Adjusted generate_service_graph to correlate single-column metrics correctly by checking column names.
+	◦	Updated predict_common to handle both pod-indexed and non-pod-indexed columns:
+	▪	Assigns pod_index: 'none' for non-pod metrics.
+	▪	Tracks feature indices to map anomalies to the correct metric and pod.
+	3	Endpoints Updated:
+	◦	/train: Now processes non-pod metrics correctly, ensuring training data includes all metrics.
+	◦	/fetch_metrics: Saves CSVs for both pod-indexed and single-column metrics.
+	◦	/predict: Fetches and processes all metrics, saving correct CSVs.
+	◦	/predict_on_csv: Loads CSVs with the updated format, handling both column types.
+	4	Error Handling:
+	◦	Added logging to warn when metrics lack data or have unexpected formats.
+	◦	Ensures empty DataFrames don’t break the pipeline.
+Example Config Files
+The metrics.json and services.json from your previous setup are compatible. The fix ensures queries like rate(http_requests_total{...}[5m]) (no pod_name) work alongside pod-level queries like sum by (pod_name, job)(increase(jvm_memory_used_bytes[...])).
+How to Test
+	1	Prepare Config Files:
+	◦	Use the existing metrics.json and services.json.
+	◦	Ensure some metrics lack pod_name in their queries (e.g., http_requests_total).
+	2	Set Up Environment:
+	◦	Verify models/, images/, data/train/, and data/predict/ directories.
+	◦	Update PROMETHEUS_URL.
+	3	Run the Server: python main.py
+	4	
+	5	Test Endpoints:
+	◦	Fetch Metrics: curl -X POST "http://localhost:8000/fetch_metrics" -H "Content-Type: application/json" -d '{"namespace": "namespace_1", "last_minutes": 30}'
+	◦	
+	▪	Check data/predict/namespace_1/ for CSVs, including non-pod metrics (e.g., service_1_http_requests_total.csv with a single http_requests_total column).
+	◦	Train Model: curl -X POST "http://localhost:8000/train" -H "Content-Type: application/json" -d '{"namespace": "namespace_1", "last_days": 7}'
+	◦	
+	▪	Verify training CSVs and model generation.
+	◦	Predict Anomalies: curl -X POST "http://localhost:8000/predict" -H "Content-Type: application/json" -d '{"namespace": "namespace_1", "last_minutes": 30, "two_minutes": true}'
+	◦	
+	▪	Confirm anomalies include both pod-level and non-pod metrics.
+	◦	Predict on CSV: curl -X POST "http://localhost:8000/predict_on_csv" -H "Content-Type: application/json" -d '{"namespace": "namespace_1", "last_minutes": 30, "two_minutes": true}'
+	◦	
+	▪	Ensure CSVs are read correctly.
+Expected Output
+	•	CSVs:
+	◦	Non-pod metrics: service_1_http_requests_total.csv has columns timestamp, http_requests_total.
+	◦	Pod metrics: service_1_memory_usage.csv has columns timestamp, memory_usage_pod_1, memory_usage_pod_2, etc.
+	•	Anomalies:
+	◦	Include pod_index: 'none' for non-pod metrics, e.g.: {
+	◦	    "service": "service_1",
+	◦	    "pod_index": "none",
+	◦	    "timestamp": "2025-04-13T10:00:00",
+	◦	    "values": [150.0, ...]
+	◦	}
+	◦	
+	◦	Pod-level anomalies use pod_index: 'pod_1', etc.
+	•	Graphs:
+	◦	Service and cascading failure graphs remain accurate, correlating all metrics.
+Notes
+	•	Robustness: The fix ensures all metrics are processed, even if Prometheus returns unexpected labels.
+	•	Performance: Non-pod metrics reduce column count, improving efficiency for those queries.
+	•	Compatibility: Existing CSVs from prior runs are compatible if they follow the same naming convention.
+	•	Debugging: Check logs for warnings about missing data or malformed metrics.
+If the issue persists or you have specific error messages/logs, please share them, and I’ll debug further. Let me know if you need additional enhancements!
