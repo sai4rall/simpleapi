@@ -43,7 +43,7 @@ DEFAULT_CONTAMINATION = 0.005
 OUTLIER_TRIM_PERCENTILE = 10
 
 
-# this is the comment i added
+# this is the comment i added comment fixed
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(GRAPH_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
